@@ -1166,7 +1166,7 @@ impl View for CustomEndpointModal {
 
         if let Some((status_text, is_error)) = self.fetch_status_line() {
             let status_color = if is_error {
-                theme.ui_error_color().into()
+                theme.ui_error_color()
             } else {
                 theme.nonactive_ui_text_color().into()
             };
