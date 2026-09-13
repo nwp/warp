@@ -29,11 +29,13 @@ Async precedent: [`CreateApiKeyModal::fetch_agents`](https://github.com/warpdotd
 Keep HTTP and merge out of the view.
 
 ```rust
+pub struct DiscoveredModel { pub id: String, pub alias: Option<String> }
+
 pub async fn discover_models(
     client: &http_client::Client,
     base_url: &str,
     api_key: &str,
-) -> Result<Vec<String>, DiscoverModelsError>
+) -> Result<Vec<DiscoveredModel>, DiscoverModelsError>
 ```
 
 - Trim `base_url`, strip one trailing `/`, request `{base}/models`.

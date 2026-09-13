@@ -56,11 +56,11 @@ Figma: none provided. Layout follows the existing custom-endpoint modal and the 
 
 7. The request uses a bounded wait (15 seconds). If it does not finish in time, the user sees a fetch-failed status and existing rows are unchanged.
 
-8. On success, Warp parses `{ "data": [ { "id": "..." }, ... ] }`. Extra fields on the object or on each entry are ignored. Blank or whitespace-only `id` values are dropped.
+8. On success, Warp parses `{ "data": [ { "id": "..." }, ... ] }`. Unknown fields on the object or on each entry are ignored. Blank or whitespace-only `id` values are dropped. If an entry has a non-empty `display_name` or `name` that differs from `id` (case-insensitive), that value is used as the row alias. `display_name` wins when both are present. Official OpenAI catalogs typically have only `id`; OpenRouter sends `name`; some Codex-shaped catalogs send `display_name`.
 
 9. Surviving IDs merge into the modal’s model rows:
    - An ID that already matches an existing row name (case-insensitive, trimmed) is skipped. That row’s alias and identity stay as they are.
-   - New IDs append in catalog order as new rows with the ID as the model name, empty alias, and a new stable model identity (same kind of identity a typed row gets).
+   - New IDs append in catalog order as new rows with the ID as the model name, the catalog alias when one was present, otherwise an empty alias, and a new stable model identity (same kind of identity a typed row gets).
    - Duplicate IDs inside one response are added at most once (first occurrence wins).
    - If the only row is the default empty row (blank name and blank alias), that empty row is removed before appending so it does not sit above fetched rows.
    - Fetch never deletes, reorders, or rewrites a row the user already filled.
