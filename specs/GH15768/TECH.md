@@ -75,7 +75,7 @@ Detection is ordinary first-token basename equality. Absolute paths whose last s
 
 ### 4. Rich input submit
 
-- `RichInputSubmitStrategy::DelayedEnter` (Claude / Grok / Gemini). Muse is a full-screen TUI; Inline is likely to swallow Enter. Confirm on a real `muse` session; switch to BracketedPaste only if DelayedEnter drops or double-submits.
+- `RichInputSubmitStrategy::BracketedPaste` (Codex / Hermes class). Muse enables bracketed paste (`CSI ? 2004 h`). A raw burst + 50ms Enter (DelayedEnter, including kitty CSI u) inserts into the composer without submitting. Wrapping the text in paste markers then sending `\r` as a second write does submit (verified against Muse 1.2.1).
 
 ### 5. No Warp-managed plugin
 
@@ -139,7 +139,7 @@ Do not land a `muse-code-warp` plugin or `plugin_manager/muse.rs` in this PR.
 ## Risks and mitigations
 
 - **Meta mark licensing.** Issue thread already notes Brand Review. Spec ships the attached official loop; legal/product can still refuse the bundle. Fallback: ship without `Icon::MuseLogo` (Hermes/Vibe) and keep Meta blue on the tile — identity still works (PRODUCT.md 3).
-- **Submit strategy.** DelayedEnter may need a one-line switch after manual testing.
+- **Submit strategy.** Use BracketedPaste, not DelayedEnter. A 50ms delayed Enter after a raw burst leaves the prompt sitting in Muse’s composer.
 - **Name collision.** Any other `muse` binary will be branded Muse Code. Accept the same risk as `agent` / `pi`; do not add extra heuristics in this PR.
 
 ## Follow-ups
