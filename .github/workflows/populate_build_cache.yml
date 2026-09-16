@@ -13,8 +13,12 @@ on:
       - 'rust-toolchain.toml'
   # Run once per day to ensure the cache is populated even if we haven't
   # modified Cargo.lock or Cargo.toml in a while.
-  schedule:
-    - cron: "0 8 * * 1-5" # Run every weekday at 3am EST.
+  # Disabled on this fork 2026-09-16: the job below is guarded to
+  # repository_owner == 'warpdotdev', so the weekday cron only failed at
+  # startup here while still billing Actions minutes. Restore if this fork
+  # ever runs its own CI.
+  # schedule:
+  #   - cron: "0 8 * * 1-5" # Run every weekday at 3am EST.
   workflow_dispatch:
 
 name: Populate Build Cache
@@ -25,3 +29,4 @@ jobs:
     if: github.repository_owner == 'warpdotdev'
     uses: ./.github/workflows/ci.yml
     secrets: inherit
+
