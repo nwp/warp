@@ -10,7 +10,10 @@ use chrono::Local;
 use cloud_object_models::CodeForge;
 use futures::channel::oneshot;
 use futures::executor::block_on;
+use futures::poll;
 use repo_metadata::{DirectoryWatcher, RepoMetadataEvent, RepoMetadataModel, RepositoryIdentifier};
+use serde_json::json;
+use session_sharing_protocol::common::{AgentAttachment, ParticipantId};
 use tempfile::TempDir;
 use warp_cli::agent::Harness;
 use warp_cli::skill::SkillSpec;
@@ -20,6 +23,7 @@ use warp_cli::{
 };
 use warp_core::channel::ChannelState;
 use warp_graphql::ai::AgentTaskState;
+use warp_graphql::platform_error::PlatformErrorMessageFormat;
 use warp_managed_secrets::ManagedSecretValue;
 use warp_multi_agent_api::response_event;
 use warp_util::standardized_path::StandardizedPath;
@@ -27,35 +31,89 @@ use warpui::r#async::Timer;
 use warpui::{App, SingletonEntity as _};
 
 use super::{
-    AgentDriver, AgentRunPrompt, CLIAgentSessionStatus, DebugWindowController, IdleTimeoutSender,
-    LEGACY_OZ_PARENT_LISTENER_MANAGED_EXTERNALLY_ENV, LEGACY_OZ_PARENT_STATE_ROOT_ENV,
-    OZ_MESSAGE_LISTENER_MANAGED_EXTERNALLY_ENV, OZ_MESSAGE_LISTENER_STATE_ROOT_ENV,
-    PlatformErrorCode, SDKConversationOutputStatus, WARP_MESSAGE_LISTENER_STATE_ROOT_ENV,
-    build_secret_env_vars, debug_turn_task_state, idle_window_for_cli_session_status,
-    idle_window_for_terminal_status, setup_failure_status_update, terminal_status_log_outcome,
+    AgentDriver, AgentDriverError, AgentRunPrompt, CLIAgentSessionStatus, DebugWindowController,
+    IdleTimeoutSender, LEGACY_OZ_PARENT_LISTENER_MANAGED_EXTERNALLY_ENV,
+    LEGACY_OZ_PARENT_STATE_ROOT_ENV, OZ_MESSAGE_LISTENER_MANAGED_EXTERNALLY_ENV,
+    OZ_MESSAGE_LISTENER_STATE_ROOT_ENV, PlatformErrorCode, PluginInstallError,
+    SDKConversationOutputStatus, WARP_MESSAGE_LISTENER_STATE_ROOT_ENV, build_secret_env_vars,
+    debug_turn_task_state, idle_window_for_cli_session_status, idle_window_for_terminal_status,
+    setup_failure_status_update, terminal_status_log_outcome,
 };
 use crate::ai::agent::conversation::{AIConversationId, ConversationStatus};
 use crate::ai::agent::task::TaskId;
 use crate::ai::agent::{
-    AIAgentActionResult, AIAgentActionResultType, AIAgentInput, AIAgentOutput,
+    AIAgentActionResult, AIAgentActionResultType, AIAgentAttachment, AIAgentInput, AIAgentOutput,
     AIAgentOutputMessage, ArtifactCreatedData, CancellationReason, MessageId, RenderableAIError,
     UploadArtifactResult,
 };
+use crate::ai::agent_sdk::driver::environment::PrepareEnvironmentError;
 use crate::ai::agent_sdk::task_env_vars;
 use crate::ai::ambient_agents::AmbientAgentTaskId;
 use crate::ai::blocklist::orchestration_events::{
     OrchestrationEventService, PendingEvent, PendingEventDetail,
 };
 use crate::ai::blocklist::{
-    BlocklistAIHistoryModel, RequestInput, ResponseStream, ResponseStreamId,
+    BlocklistAIHistoryModel, QueuedQuery, QueuedQueryModel, QueuedQueryOrigin, RequestInput,
+    ResponseStream, ResponseStreamId,
 };
 use crate::ai::cloud_environments::{GithubRepo, SourceRepo};
 use crate::ai::llms::LLMId;
 use crate::ai::skills::SkillManager;
 use crate::test_util::assert_eventually;
 use crate::test_util::terminal::{add_window_with_terminal, initialize_app_for_terminal_view};
+use crate::workspace::view::tests::initialize_app as initialize_workspace_test_app;
 
 // ── IdleTimeoutSender tests ──────────────────────────────────────────────────────
+
+#[test]
+fn setup_timeout_does_not_retain_a_potentially_running_command() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let terminal = add_window_with_terminal(&mut app, None);
+        let temp = TempDir::new().unwrap();
+        let driver = app.add_model(|ctx| {
+            let terminal_driver =
+                super::terminal::TerminalDriver::create_from_existing_view(terminal, ctx);
+            let mut driver =
+                AgentDriver::new_for_test(temp.path().to_path_buf(), terminal_driver, ctx);
+            driver.idle_on_fail = Some(Duration::from_secs(30 * 60));
+            driver
+        });
+        let spawner = driver.update(&mut app, |_, ctx| ctx.spawner());
+        let error = AgentDriverError::SetupCommandTimedOut {
+            message: "Setup command #1 timed out after 1800s: ./setup.sh".to_string(),
+        };
+        let mut linger = Box::pin(AgentDriver::linger_after_failure(
+            &spawner,
+            "environment_setup",
+            &error,
+        ));
+        assert!(poll!(linger.as_mut()).is_ready());
+        assert_eq!(
+            setup_failure_status_update(&error).error_code,
+            Some(PlatformErrorCode::EnvironmentSetupFailed)
+        );
+    });
+}
+
+#[test]
+fn driver_keeps_uninterpreted_factory_experiments() {
+    App::test((), |mut app| async move {
+        initialize_workspace_test_app(&mut app);
+        let experimental: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_value(json!({
+                "identityOnlySystemPrompt": true,
+                "private-uid-sentinel": "secret-value-sentinel"
+            }))
+            .unwrap();
+        let mut options = crate::ai::agent_sdk::tests::agent_driver_options();
+        options.experimental = Some(experimental.clone());
+        let driver = app.add_model(|ctx| AgentDriver::new(options, ctx).unwrap());
+        driver.read(&app, |driver, _| {
+            assert_eq!(driver.experimental, Some(experimental));
+        });
+    });
+}
 
 #[test]
 fn idle_timeout_sender_send_now_delivers_value() {
@@ -145,6 +203,17 @@ fn idle_timeout_sender_complete_with_optional_idle_some_defers_then_delivers() {
     assert_eq!(rx.try_recv().unwrap(), None);
 
     std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(rx.try_recv().unwrap(), Some(7));
+}
+
+#[test]
+fn idle_timeout_sender_complete_with_zero_idle_sends_immediately() {
+    let (tx, mut rx) = oneshot::channel::<i32>();
+    let idle_timeout = IdleTimeoutSender::new(tx);
+    idle_timeout.end_run_after(Duration::from_millis(50), 1);
+
+    idle_timeout.complete_with_optional_idle(Some(Duration::ZERO), 7);
+
     assert_eq!(rx.try_recv().unwrap(), Some(7));
 }
 
@@ -427,11 +496,36 @@ fn setup_failure_is_reported_as_an_environment_setup_failure() {
     // alone, and the cloud-continuation resolver uses it to decide that a setup failure with no
     // conversation gets a tombstone with no continue CTA. A generic code silently reroutes those
     // runs into continuation handling that has nothing to continue.
-    let status = setup_failure_status_update("Environment setup failed: bad command".to_string());
+    let status = setup_failure_status_update(&AgentDriverError::EnvironmentSetupFailed(
+        "bad command".to_string(),
+    ));
 
     assert_eq!(
         status.error_code,
         Some(PlatformErrorCode::EnvironmentSetupFailed)
+    );
+}
+
+#[test]
+fn retained_setup_failure_includes_markdown_output_and_recovery_hint() {
+    let error = AgentDriverError::from(PrepareEnvironmentError::SetupCommand {
+        command: "./setup.sh".to_string(),
+        output: Some("permission denied".to_string()),
+    });
+    let status = setup_failure_status_update(&error);
+    let messages = &status.platform_error.as_ref().unwrap().user_facing_messages;
+
+    assert_eq!(
+        status.message,
+        "Environment setup failed: Failed to run setup command: ./setup.sh\nCommand output:\npermission denied. Check your repository URLs and setup commands."
+    );
+    assert_eq!(
+        messages[&PlatformErrorMessageFormat::PlainText],
+        status.message
+    );
+    assert_eq!(
+        messages[&PlatformErrorMessageFormat::Markdown],
+        "Failed to run setup command `./setup.sh`:\n\n    permission denied\n\nCheck your repository URLs and setup commands."
     );
 }
 
@@ -1595,6 +1689,237 @@ fn driver_wired_for_terminal(
     driver_handle
 }
 
+#[test]
+fn native_startup_queue_prevents_exit_until_pending_rows_are_removed() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let terminal = add_window_with_terminal(&mut app, None);
+        let (terminal_id, controller) = terminal.read(&app, |terminal, _| {
+            (terminal.id(), terminal.ai_controller().clone())
+        });
+        let (id, stream) =
+            conversation_with_in_progress_mock_stream(&mut app, terminal_id, &controller);
+        controller.update(&mut app, |controller, ctx| {
+            controller.bind_native_prompt_conversation(Some(id), ctx);
+        });
+        // The driver's own skip_initial_turn dispatch drains an (empty, at this point) startup
+        // queue for `id` here, so it doesn't disturb the mock stream created above.
+        let _driver = driver_wired_for_terminal(&mut app, terminal, None);
+
+        // A row queued for this conversation after setup has finished keeps the driver from
+        // exiting even once the (unrelated, pre-existing) stream finishes successfully.
+        let queued_id = QueuedQueryModel::handle(&app).update(&mut app, |queue, ctx| {
+            queue.append(
+                id,
+                QueuedQuery::new_shared_session_prompt(
+                    "followup".into(),
+                    ParticipantId::new(),
+                    vec![],
+                    None,
+                ),
+                ctx,
+            )
+        });
+        complete_mock_stream_successfully(&mut app, &stream);
+        OrchestrationEventService::handle(&app).read(&app, |service, _| {
+            assert!(!service.is_conversation_exiting(id));
+        });
+        QueuedQueryModel::handle(&app).update(&mut app, |queue, ctx| {
+            assert!(queue.remove_by_id(id, queued_id, ctx).is_some());
+        });
+        OrchestrationEventService::handle(&app).read(&app, |service, _| {
+            assert!(service.is_conversation_exiting(id));
+        });
+    });
+}
+
+#[test]
+fn prepared_native_followup_starts_before_the_last_queued_row_allows_exit() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let terminal = add_window_with_terminal(&mut app, None);
+        let (terminal_id, controller) = terminal.read(&app, |terminal, _| {
+            (terminal.id(), terminal.ai_controller().clone())
+        });
+        let (id, stream) =
+            conversation_with_in_progress_mock_stream(&mut app, terminal_id, &controller);
+        controller.update(&mut app, |controller, ctx| {
+            controller.bind_native_prompt_conversation(Some(id), ctx);
+        });
+        let temp = TempDir::new().unwrap();
+        let driver = app.add_model(|ctx| {
+            let terminal_driver =
+                super::terminal::TerminalDriver::create_from_existing_view(terminal, ctx);
+            let mut driver =
+                AgentDriver::new_for_test(temp.path().to_path_buf(), terminal_driver, ctx);
+            driver.skip_initial_turn = true;
+            driver.idle_on_complete = None;
+            driver.run_conversation_id = Some(id);
+            driver
+        });
+        let _run_exit_rx = driver.update(&mut app, |driver, ctx| {
+            driver.execute_run(AgentRunPrompt::Local(String::new()), ctx)
+        });
+        let query_id = QueuedQueryModel::handle(&app).update(&mut app, |queue, ctx| {
+            queue.append(
+                id,
+                QueuedQuery::new_shared_session_prompt(
+                    "file followup".into(),
+                    ParticipantId::new(),
+                    vec![AgentAttachment::FileReference {
+                        attachment_id: "attachment-id".into(),
+                        file_name: "event-payload.json".into(),
+                    }],
+                    None,
+                ),
+                ctx,
+            )
+        });
+
+        complete_mock_stream_successfully(&mut app, &stream);
+        stream.update(&mut app, |stream, ctx| {
+            stream.emit_after_stream_finished_for_test(ctx);
+        });
+        BlocklistAIHistoryModel::handle(&app).read(&app, |history, _| {
+            assert_eq!(
+                history.conversation(&id).unwrap().status(),
+                &ConversationStatus::Success
+            );
+        });
+        OrchestrationEventService::handle(&app).read(&app, |service, _| {
+            assert!(!service.is_conversation_exiting(id));
+        });
+
+        QueuedQueryModel::handle(&app).update(&mut app, |queue, ctx| {
+            queue.complete_preparation(
+                id,
+                query_id,
+                HashMap::from([(
+                    "event-payload.json".into(),
+                    AIAgentAttachment::FilePathReference {
+                        file_id: "attachment-id".into(),
+                        file_name: "event-payload.json".into(),
+                        file_path: "/workspace/.warp/attachments/attachment-id_event-payload.json"
+                            .into(),
+                    },
+                )]),
+                ctx,
+            );
+        });
+
+        OrchestrationEventService::handle(&app).read(&app, |service, _| {
+            assert!(!service.is_conversation_exiting(id));
+        });
+        BlocklistAIHistoryModel::handle(&app).read(&app, |history, _| {
+            let conversation = history.conversation(&id).unwrap();
+            assert_eq!(conversation.status(), &ConversationStatus::InProgress);
+            assert_eq!(conversation.exchange_count(), 2);
+            assert!(conversation.root_task_exchanges().any(|exchange| {
+                exchange.input.iter().any(
+                    |input| matches!(input, AIAgentInput::UserQuery { query, .. } if query == "file followup"),
+                )
+            }));
+        });
+        controller.read(&app, |controller, ctx| {
+            assert!(controller.has_active_stream_for_conversation(id, ctx));
+        });
+        QueuedQueryModel::handle(&app).read(&app, |queue, _| {
+            assert!(!queue.has_queue(id));
+        });
+    });
+}
+
+#[test]
+fn native_startup_queue_prevents_exit_until_a_local_row_is_removed() {
+    // Regression test: exit-deferral must not be specific to shared-session-injected rows --
+    // a plain local row (e.g. queued via `/queue` against this same conversation) has to hold
+    // the run open exactly the same way, since `dispatch_queued_warp_agent_prompt` dispatches
+    // either kind identically.
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let terminal = add_window_with_terminal(&mut app, None);
+        let (terminal_id, controller) = terminal.read(&app, |terminal, _| {
+            (terminal.id(), terminal.ai_controller().clone())
+        });
+        let (id, stream) =
+            conversation_with_in_progress_mock_stream(&mut app, terminal_id, &controller);
+        controller.update(&mut app, |controller, ctx| {
+            controller.bind_native_prompt_conversation(Some(id), ctx);
+        });
+        let _driver = driver_wired_for_terminal(&mut app, terminal, None);
+
+        let queued_id = QueuedQueryModel::handle(&app).update(&mut app, |queue, ctx| {
+            queue.append(
+                id,
+                QueuedQuery::new(
+                    "local followup".into(),
+                    QueuedQueryOrigin::QueueSlashCommand,
+                ),
+                ctx,
+            )
+        });
+        complete_mock_stream_successfully(&mut app, &stream);
+        OrchestrationEventService::handle(&app).read(&app, |service, _| {
+            assert!(!service.is_conversation_exiting(id));
+        });
+        QueuedQueryModel::handle(&app).update(&mut app, |queue, ctx| {
+            assert!(queue.remove_by_id(id, queued_id, ctx).is_some());
+        });
+        OrchestrationEventService::handle(&app).read(&app, |service, _| {
+            assert!(service.is_conversation_exiting(id));
+        });
+    });
+}
+
+#[test]
+fn native_promptless_setup_dispatches_only_the_head_queued_prompt() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let terminal = add_window_with_terminal(&mut app, None);
+        let controller = terminal.read(&app, |terminal, _| terminal.ai_controller().clone());
+        let id = controller.update(&mut app, |controller, ctx| {
+            let id = controller.bind_native_prompt_conversation(None, ctx);
+            controller.execute_warp_agent_prompt_from_shared_session_injection(
+                "first".into(),
+                None,
+                vec![],
+                ParticipantId::new(),
+                None,
+                ctx,
+            );
+            controller.execute_warp_agent_prompt_from_shared_session_injection(
+                "second".into(),
+                None,
+                vec![],
+                ParticipantId::new(),
+                None,
+                ctx,
+            );
+            id
+        });
+        let _driver = driver_wired_for_terminal(&mut app, terminal, None);
+        // Only the head ("first") is sent as soon as setup finishes; "second" stays queued for
+        // the next natural request boundary (a tool-result follow-up) or the conversation going
+        // idle, rather than being dispatched right away and interrupting "first"'s barely-started
+        // stream before it produces any output.
+        BlocklistAIHistoryModel::handle(&app).read(&app, |history, _| {
+            let conversation = history.conversation(&id).unwrap();
+            assert_eq!(conversation.exchange_count(), 1);
+            assert_eq!(conversation.status(), &ConversationStatus::InProgress);
+        });
+        QueuedQueryModel::handle(&app).read(&app, |queue, _| {
+            assert_eq!(
+                queue
+                    .queue(id)
+                    .iter()
+                    .map(QueuedQuery::text)
+                    .collect::<Vec<_>>(),
+                vec!["second"],
+            );
+        });
+    });
+}
+
 /// QUALITY-1801 regression: a child agent's message, queued in
 /// `OrchestrationEventService` while the parent's own turn is still streaming, must
 /// not start a new MAA request once the parent's ambient run has committed to an
@@ -2114,5 +2439,32 @@ fn openai_api_key_exports_only_api_key_not_base_url() {
     assert!(
         !env_vars.contains_key(&OsString::from("OPENAI_BASE_URL")),
         "OPENAI_BASE_URL should NOT be exported as an env var"
+    );
+}
+
+#[test]
+fn plugin_failure_reason_appends_cli_log_when_present() {
+    let error = PluginInstallError {
+        message: "'claude plugin marketplace add x' failed".to_owned(),
+        log: "$ claude plugin marketplace add x\nno distributions installed\n".to_owned(),
+    };
+
+    assert_eq!(
+        AgentDriver::plugin_failure_reason("Install failed", &error),
+        "Install failed: 'claude plugin marketplace add x' failed\n\
+         $ claude plugin marketplace add x\nno distributions installed"
+    );
+}
+
+#[test]
+fn plugin_failure_reason_omits_empty_cli_log() {
+    let error = PluginInstallError {
+        message: "No plugin manager available".to_owned(),
+        log: "  \n".to_owned(),
+    };
+
+    assert_eq!(
+        AgentDriver::plugin_failure_reason("Install failed", &error),
+        "Install failed: No plugin manager available"
     );
 }

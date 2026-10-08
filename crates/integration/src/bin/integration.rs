@@ -128,6 +128,7 @@ fn register_tests() -> HashMap<&'static str, BoxedBuilderFn> {
     // Add new tests here
     register_test!(test_single_command);
     register_test!(test_add_and_close_session);
+    register_test!(test_child_pill_after_reopening_closed_parent_tab);
     register_test!(test_add_many_sessions);
     register_test!(test_ctrl_tab_session_switching);
     register_test!(test_ctrl_d_eot);
@@ -216,6 +217,7 @@ fn register_tests() -> HashMap<&'static str, BoxedBuilderFn> {
     register_test!(test_builtin_completions);
     register_test!(test_keyword_completions);
     register_test!(test_native_shell_completions_menu);
+    register_test!(test_zsh_native_completions_without_compinit_use_filepaths);
     register_test!(test_command_runs_cleanly_after_native_shell_completion);
     register_test!(test_native_shell_completions_used_when_no_bundled_spec);
     register_test!(test_native_shell_completions_skipped_when_a_bundled_spec_answers);

@@ -53,7 +53,7 @@ Add the variant next to `Grok` and wire every exhaustive match (compiler will li
 | `skill_command_prefix` | `"/"` |
 | `supports_bash_mode` | `true` |
 | `supports_cli_agent_footer` | `true` (default) |
-| `From` → `CLIAgentType` | `Muse` |
+| `telemetry_name` | `"Muse"` |
 
 Do **not** add `Harness::Muse`. Do **not** add `SkillProvider::Muse`. Identifiers stay short (`CLIAgent::Muse`); user-facing copy is **Muse Code**.
 
@@ -91,7 +91,7 @@ Hook probing notes (what fires, HookConfig shape) live in `specs/GH15768/warp-ho
 
 ### 6. Telemetry + settings
 
-- `CLIAgentType::Muse` and the `From<CLIAgent>` arm.
+- `CLIAgent::Muse => "Muse"` in `telemetry_name()`.
 - Settings third-party dropdown picks the variant up via `enum_iterator::all`; no extra row.
 
 ### 7. Tests (in-repo)

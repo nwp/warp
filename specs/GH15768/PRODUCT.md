@@ -20,7 +20,7 @@ Muse Code sessions currently render as a generic terminal: Warp’s hardcoded `C
 - Brand identity in every surface that already uses `CLIAgent` chrome: footer tile, tab/pane icon, vertical tabs.
 - The standard CLI-agent toolbelt, rich input, image attach, code-review comments, attach-code-as-context, Tab Configs, and Remote Control — whatever those surfaces already do for a recognized agent, with no Muse-only layout.
 - Session listener support for structured OSC 777 events with `"agent":"muse"` **if** Muse or an agent-owned integration emits them. Warp does not install that integration.
-- Telemetry: a distinct `CLIAgentType` for Muse Code.
+- Telemetry: `CLIAgent::telemetry_name()` returns `"Muse"` (no longer `"Unknown"`).
 - Unit coverage for detection, identity, listener support, and the **absence** of a Warp-managed plugin flow.
 
 **Out of scope**

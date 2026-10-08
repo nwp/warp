@@ -2093,6 +2093,8 @@ impl TuiTerminalSessionView {
                 }
                 QueuedQueryEvent::DefaultModeChanged => ctx.notify(),
                 QueuedQueryEvent::Appended { .. }
+                | QueuedQueryEvent::PromptReady { .. }
+                | QueuedQueryEvent::DispatchStateChanged { .. }
                 | QueuedQueryEvent::RowUnlocked { .. }
                 | QueuedQueryEvent::Removed { .. }
                 | QueuedQueryEvent::Reordered { .. }
@@ -5170,6 +5172,24 @@ impl TuiTerminalSessionView {
             }
             ShellCommandExecutorEvent::CancelExecution => {
                 ctx.emit(TuiTerminalSessionEvent::InterruptPty);
+            }
+            ShellCommandExecutorEvent::InterruptForInjectedFollowup {
+                conversation_id,
+                block_id,
+            } => {
+                let should_interrupt = {
+                    let model = model.lock();
+                    let block = model.block_list().active_block();
+                    block.id() == block_id
+                        && block.ai_conversation_id() == Some(*conversation_id)
+                        && block.is_executing()
+                        && !block
+                            .long_running_control_state()
+                            .is_some_and(|state| state.is_user_in_control())
+                };
+                if should_interrupt {
+                    ctx.emit(TuiTerminalSessionEvent::InterruptPty);
+                }
             }
             ShellCommandExecutorEvent::TransferControlToUser {
                 action_id: _,

@@ -46,6 +46,10 @@ use crate::ai::agent::icons::{
     failed_icon, gray_stop_icon, in_progress_icon, succeeded_icon, yellow_stop_icon,
 };
 use crate::ai::agent::linearization::compute_task_depths;
+use crate::ai::agent::request_metadata::{
+    InferenceUsageType, LegacyCharges, RequestMetadataRecord, RequestModelCharge,
+    RequestPlatformCharge, TurnPanelData,
+};
 use crate::ai::agent::todos::AIAgentTodoList;
 use crate::ai::agent::{
     AIAgentOutputMessage, AIAgentOutputMessageType, AIIdentifiers, CancellationOutcome,
@@ -64,7 +68,7 @@ use crate::notebooks::NotebookId;
 use crate::persistence::ModelEvent;
 use crate::persistence::model::{
     AgentConversationData, ChargedUsageTotals, ContextWindowSegment, ConversationUsageMetadata,
-    ModelTokenUsage, PersistedAutoexecuteMode, ToolUsageMetadata,
+    ModelTokenUsage, PRIMARY_AGENT_CATEGORY, PersistedAutoexecuteMode, ToolUsageMetadata,
 };
 use crate::server::ids::ServerId;
 use crate::terminal::general_settings::GeneralSettings;
@@ -218,10 +222,10 @@ pub struct ConversationUsageTotals {
     /// shows as "Credits spent (total)" and the conversation details panel
     /// shows as "Credits used".
     pub credits_spent: f32,
-    /// Total provider cost across all models, in US cents. `None` means the
-    /// server did not provide a historical baseline; it must not be rendered
-    /// as `$0.00` or as an incremental-only total.
-    pub cost_in_cents: Option<f32>,
+    /// The server's cumulative snapshot of what the customer was billed, in US
+    /// cents. `None` means the server did not establish one; it must not be
+    /// rendered as `$0.00`.
+    pub billed_cost_in_cents: Option<f32>,
     /// Whether the conversation has reported any usage. Derived from the
     /// contents of the usage metadata (not its mere presence), so a restored
     /// conversation that never ran a request keeps the footer entry hidden,
@@ -237,12 +241,13 @@ pub struct ConversationUsageTotals {
 }
 
 impl ConversationUsageTotals {
-    /// Returns the summed total of the tracked usage
-    /// if not available, falls back to the legacy provider total
+    /// Cost billed to the customer so far, in US cents: the summed per-turn charges when the
+    /// server streamed them, otherwise the GraphQL billed total. `None` when neither is known;
+    /// the provider cost is never a substitute.
     pub fn total_cost_in_cents(&self) -> Option<f32> {
         self.charged_usage
             .map(|usage| usage.total_cost_in_cents())
-            .or(self.cost_in_cents)
+            .or(self.billed_cost_in_cents)
     }
 }
 
@@ -252,12 +257,12 @@ impl ConversationUsageTotals {
 /// metadata blob, and a restored conversation that never ran a request must
 /// keep the footer's usage entry hidden.
 fn usage_metadata_indicates_usage(metadata: &ConversationUsageMetadata) -> bool {
-    // A present provider cost counts even at 0.0: the server only records a
+    // A present billed cost counts even at 0.0: the server only records a
     // cost once a turn has completed accounting, so `Some(0.0)` is a known
     // zero baseline (rendered as $0.00), unlike `None` (unknown).
     metadata.credits_spent != 0.0
         || metadata.platform_credits_spent != 0.0
-        || metadata.total_provider_cost_in_cents.is_some()
+        || metadata.total_billed_cost_in_cents.is_some()
         || !metadata.token_usage.is_empty()
         || metadata.context_window_usage != 0.0
         || metadata.was_summarized
@@ -388,10 +393,6 @@ pub struct AIConversation {
 
     total_request_cost: RequestCost,
     total_token_usage_by_model: HashMap<String, TokenUsage>,
-    /// Server-authoritative cumulative provider cost in US cents. New
-    /// conversations start at a known zero; restored legacy conversations can
-    /// remain `None` until a server snapshot is available.
-    total_provider_cost_in_cents: Option<f32>,
     /// True once hydrated usage metadata shows evidence of usage (see
     /// [`usage_metadata_indicates_usage`]) or a live response reports usage
     /// (even when its numeric totals are zero).
@@ -446,6 +447,10 @@ pub struct AIConversation {
     /// only matters for the live process that bootstrapped the conversation, and a restored
     /// conversation resumes ordinary synchronization.
     task_sync_mode: TaskSyncMode,
+
+    /// Whether the user chose Warp-funded inference for this conversation after a ChatGPT
+    /// token-sharing failure. Sticky for the rest of the conversation and inherited by forks.
+    use_warp_credits_instead_of_chatgpt: bool,
 }
 
 pub(crate) fn artifact_from_fork_proto(
@@ -490,7 +495,6 @@ impl AIConversation {
             dismissed_suggestion_ids: Default::default(),
             total_request_cost: RequestCost::new(0.),
             total_token_usage_by_model: Default::default(),
-            total_provider_cost_in_cents: Some(0.),
             has_usage_metadata: false,
             fallback_display_title: None,
             artifacts: Vec::new(),
@@ -503,6 +507,7 @@ impl AIConversation {
             orchestration_configs: HashMap::new(),
             pinned: false,
             task_sync_mode: TaskSyncMode::default(),
+            use_warp_credits_instead_of_chatgpt: false,
         }
     }
 
@@ -639,6 +644,7 @@ impl AIConversation {
             autoexecute_override,
             last_event_sequence,
             pinned,
+            use_warp_credits_instead_of_chatgpt,
         ) = if let Some(data) = conversation_data {
             let server_conversation_token = data
                 .server_conversation_token
@@ -695,6 +701,7 @@ impl AIConversation {
                 autoexecute_override,
                 data.last_event_sequence,
                 data.pinned,
+                data.use_warp_credits_instead_of_chatgpt,
             )
         } else {
             (
@@ -713,9 +720,9 @@ impl AIConversation {
                 AIConversationAutoexecuteMode::default(),
                 None,
                 false,
+                false,
             )
         };
-        let total_provider_cost_in_cents = conversation_usage_metadata.total_provider_cost_in_cents;
 
         Ok(Self {
             id,
@@ -742,7 +749,6 @@ impl AIConversation {
             dismissed_suggestion_ids: Default::default(),
             total_request_cost: RequestCost::new(0.),
             total_token_usage_by_model: Default::default(),
-            total_provider_cost_in_cents,
             has_usage_metadata,
             optimistic_cli_subagent_subtask_id: None,
             fallback_display_title: None,
@@ -756,6 +762,7 @@ impl AIConversation {
             orchestration_configs: HashMap::new(),
             pinned,
             task_sync_mode: TaskSyncMode::default(),
+            use_warp_credits_instead_of_chatgpt,
         })
     }
 
@@ -846,14 +853,12 @@ impl AIConversation {
         self.conversation_usage_metadata.platform_credits_spent = 0.0;
     }
 
-    /// Test-only helper that sets (or clears) the conversation's dollar-cost
+    /// Test-only helper that sets (or clears) the conversation's billed-cost
     /// baseline directly, mirroring what `set_server_metadata` would derive
     /// from a real snapshot, without wiring up a full snapshot.
     #[cfg(test)]
-    pub(crate) fn set_cost_in_cents_for_test(&mut self, cost_in_cents: Option<f32>) {
-        self.total_provider_cost_in_cents = cost_in_cents;
-        self.conversation_usage_metadata
-            .total_provider_cost_in_cents = cost_in_cents;
+    pub(crate) fn set_billed_cost_in_cents_for_test(&mut self, cost_in_cents: Option<f32>) {
+        self.conversation_usage_metadata.total_billed_cost_in_cents = cost_in_cents;
     }
 
     /// Test-only helper that sets (or clears) the conversation's cumulative
@@ -875,6 +880,13 @@ impl AIConversation {
     ) {
         self.conversation_usage_metadata
             .charged_usage_for_last_block = charged_usage;
+    }
+
+    /// Test-only helper to set credits directly without generating a full `StreamFinished` event.
+    #[cfg(test)]
+    pub(crate) fn set_credits_spent_for_last_block_for_test(&mut self, credits: f32) {
+        self.conversation_usage_metadata
+            .credits_spent_for_last_block = Some(credits);
     }
 
     /// Test-only helper that simulates the root-task upgrade performed by the
@@ -1231,14 +1243,14 @@ impl AIConversation {
         // relative to live per-request cost accounting, so a snapshot may
         // only seed or advance the displayed total — never regress it or
         // re-add costs the client already counted.
-        if let Some(total_provider_cost_in_cents) = metadata.usage.total_provider_cost_in_cents
+        if let Some(total_billed_cost_in_cents) = metadata.usage.total_billed_cost_in_cents
             && self
-                .total_provider_cost_in_cents
-                .is_none_or(|current| total_provider_cost_in_cents >= current)
+                .conversation_usage_metadata
+                .total_billed_cost_in_cents
+                .is_none_or(|current| total_billed_cost_in_cents >= current)
         {
-            self.total_provider_cost_in_cents = Some(total_provider_cost_in_cents);
-            self.conversation_usage_metadata
-                .total_provider_cost_in_cents = Some(total_provider_cost_in_cents);
+            self.conversation_usage_metadata.total_billed_cost_in_cents =
+                Some(total_billed_cost_in_cents);
         }
         // Usage evidence is derived from the metadata's contents (not its
         // presence) so a zero-usage conversation keeps the footer entry
@@ -1314,6 +1326,18 @@ impl AIConversation {
     /// `write_updated_conversation_state` to push the change to SQLite.
     pub fn set_pinned(&mut self, pinned: bool) {
         self.pinned = pinned;
+    }
+
+    /// Returns whether requests in this conversation must run on Warp's OpenAI key instead of
+    /// the user's ChatGPT subscription.
+    pub fn use_warp_credits_instead_of_chatgpt(&self) -> bool {
+        self.use_warp_credits_instead_of_chatgpt
+    }
+
+    /// Switches the rest of this conversation to Warp-funded inference. Callers must follow up
+    /// with `write_updated_conversation_state` to push the change to SQLite.
+    pub fn set_use_warp_credits_instead_of_chatgpt(&mut self) {
+        self.use_warp_credits_instead_of_chatgpt = true;
     }
 
     /// Returns true if this conversation was spawned by a parent orchestrator
@@ -2308,7 +2332,7 @@ impl AIConversation {
     pub fn update_cost_and_usage_for_request(
         &mut self,
         request_cost: Option<RequestCost>,
-        request_charges: Option<stream_finished::RequestCharges>,
+        request_charges: Option<api::RequestCharges>,
         token_usage: Vec<TokenUsage>,
         usage_metadata: Option<stream_finished::ConversationUsageMetadata>,
         was_user_initiated_request: bool,
@@ -2317,9 +2341,6 @@ impl AIConversation {
         self.has_usage_metadata |=
             request_cost.is_some() || usage_metadata.is_some() || !token_usage.is_empty();
         for usage in token_usage.into_iter() {
-            if let Some(total_provider_cost_in_cents) = self.total_provider_cost_in_cents.as_mut() {
-                *total_provider_cost_in_cents += usage.cost_in_cents;
-            }
             let entry = self
                 .total_token_usage_by_model
                 .entry(usage.model_id.clone())
@@ -2411,8 +2432,6 @@ impl AIConversation {
                 self.conversation_usage_metadata.was_summarized = usage_metadata.summarized;
             }
         }
-        self.conversation_usage_metadata
-            .total_provider_cost_in_cents = self.total_provider_cost_in_cents;
         Ok(())
     }
 
@@ -3517,6 +3536,218 @@ impl AIConversation {
         self.task_store.get(task_id)
     }
 
+    /// We have to check all tasks for the messages because summarization moves them to a new task
+    /// (`Action::MoveMessagesToNewTask`)
+    fn exchange_request_ids(&self, exchange_id: AIAgentExchangeId) -> HashSet<String> {
+        let Some(exchange) = self.all_tasks().find_map(|task| task.exchange(exchange_id)) else {
+            return HashSet::new();
+        };
+        self.all_tasks()
+            .flat_map(|task| task.messages())
+            .filter(|message| {
+                exchange
+                    .added_message_ids
+                    .contains(&MessageId::new(message.id.clone()))
+            })
+            .map(|message| message.request_id.clone())
+            .filter(|request_id| !request_id.is_empty())
+            .collect()
+    }
+
+    pub fn request_metadata_records_for_exchange(
+        &self,
+        exchange_id: AIAgentExchangeId,
+    ) -> Vec<RequestMetadataRecord> {
+        let request_ids = self.exchange_request_ids(exchange_id);
+        if request_ids.is_empty() {
+            return Vec::new();
+        }
+        let mut seen_message_ids = HashSet::new();
+        self.all_tasks()
+            .flat_map(|task| task.messages())
+            .filter(|message| request_ids.contains(message.request_id.as_str()))
+            .filter_map(RequestMetadataRecord::from_message)
+            .filter(|record| seen_message_ids.insert(record.message_id.clone()))
+            .collect()
+    }
+
+    /// Given the provided exchange id, get all exchange ids for the turn containing that exchange
+    pub fn turn_exchange_ids(&self, exchange_id: AIAgentExchangeId) -> Vec<AIAgentExchangeId> {
+        let mut turn = Vec::new();
+        let mut turn_contains_exchange = false;
+        for exchange in self.root_task_exchanges() {
+            if exchange.has_user_query() {
+                if turn_contains_exchange {
+                    break;
+                }
+                turn.clear();
+            }
+            turn.push(exchange.id);
+            turn_contains_exchange |= exchange.id == exchange_id;
+        }
+        if turn_contains_exchange {
+            turn
+        } else {
+            vec![exchange_id]
+        }
+    }
+
+    pub fn is_last_exchange_in_turn(&self, exchange_id: AIAgentExchangeId) -> bool {
+        self.turn_exchange_ids(exchange_id).last() == Some(&exchange_id)
+    }
+
+    pub fn request_metadata_records_for_turn(
+        &self,
+        exchange_id: AIAgentExchangeId,
+    ) -> Vec<RequestMetadataRecord> {
+        let mut seen_message_ids = HashSet::new();
+        self.turn_exchange_ids(exchange_id)
+            .into_iter()
+            .flat_map(|id| self.request_metadata_records_for_exchange(id))
+            .filter(|record| seen_message_ids.insert(record.message_id.clone()))
+            .collect()
+    }
+
+    /// Because this panel relies on `RequestMetadata` to populate its fields, and that message
+    /// does not exist for historical conversations, we fallback to `conversation_metadata` to
+    /// display what we have
+    pub fn turn_panel_data(&self, exchange_id: AIAgentExchangeId) -> Option<TurnPanelData> {
+        if !self.is_last_exchange_in_turn(exchange_id) {
+            return None;
+        }
+        if let Some(records) = self.turn_panel_records(exchange_id) {
+            return Some(TurnPanelData::Records(records));
+        }
+
+        let turn_exchange_ids = self.turn_exchange_ids(exchange_id);
+        let mut records: Vec<RequestMetadataRecord> = turn_exchange_ids
+            .iter()
+            .filter_map(|id| self.exchange_with_id(*id))
+            .map(|exchange| RequestMetadataRecord {
+                request_started_at: Some(exchange.start_time),
+                first_token_at: exchange
+                    .time_to_first_token_ms
+                    .map(|ms| exchange.start_time + chrono::Duration::milliseconds(ms)),
+                request_ended_at: exchange.finish_time,
+                ..Default::default()
+            })
+            .collect();
+
+        let is_latest_turn = self
+            .root_task_exchanges()
+            .last()
+            .is_some_and(|latest| turn_exchange_ids.last() == Some(&latest.id));
+        let context_window_usage = self
+            .request_metadata_records_for_turn(exchange_id)
+            .iter()
+            .rev()
+            .find_map(|record| record.context_window_usage)
+            .or_else(|| {
+                is_latest_turn
+                    .then(|| self.context_window_usage())
+                    .filter(|usage| *usage > 0.0)
+            });
+
+        let legacy_charges = if !is_latest_turn {
+            LegacyCharges::Unknown
+        } else {
+            // The unrounded credits figure: the footer's one-decimal rounding would turn a real
+            // sub-0.1 charge into zero before the panel could label it "<0.1 credits".
+            let credits_spent_for_last_block = self
+                .conversation_usage_metadata
+                .credits_spent_for_last_block;
+            match self.charged_usage_for_last_block() {
+                Some(totals) => LegacyCharges::Breakdown(Box::new(totals)),
+                None => match credits_spent_for_last_block {
+                    Some(credits) => LegacyCharges::CreditsOnly(credits),
+                    None => LegacyCharges::Unknown,
+                },
+            }
+        };
+
+        let (model_charges, platform_charges) = match &legacy_charges {
+            LegacyCharges::Breakdown(totals) => {
+                let inference_credits = (
+                    totals.input_cost_in_credits,
+                    totals.output_cost_in_credits,
+                    totals.input_cache_read_cost_in_credits,
+                    totals.input_cache_write_cost_in_credits,
+                );
+                let model_charge = RequestModelCharge {
+                    category: PRIMARY_AGENT_CATEGORY.to_string(),
+                    usage_type: InferenceUsageType::DirectApi,
+                    model_id: "Models".to_string(),
+                    input_tokens: totals.input_tokens,
+                    output_tokens: totals.output_tokens,
+                    cache_read_tokens: totals.input_cache_read_tokens,
+                    cache_write_tokens: totals.input_cache_write_tokens,
+                    input_cost_in_cents: totals.input_cost_in_cents,
+                    output_cost_in_cents: totals.output_cost_in_cents,
+                    cache_read_cost_in_cents: totals.input_cache_read_cost_in_cents,
+                    cache_write_cost_in_cents: totals.input_cache_write_cost_in_cents,
+                    input_cost_in_credits: inference_credits.0,
+                    output_cost_in_credits: inference_credits.1,
+                    cache_read_cost_in_credits: inference_credits.2,
+                    cache_write_cost_in_credits: inference_credits.3,
+                    web_search_count: totals.web_search_count,
+                    web_search_cost_in_cents: totals.web_search_cost_in_cents,
+                    web_search_cost_in_credits: totals.web_search_cost_in_credits,
+                };
+                let platform_charges = [(
+                    totals.platform_cost_in_cents,
+                    totals.platform_cost_in_credits,
+                )]
+                .iter()
+                .filter(|(cents, credits)| *cents != 0.0 || *credits != 0.0)
+                .map(|&(cents, credits)| RequestPlatformCharge {
+                    category: PRIMARY_AGENT_CATEGORY.to_string(),
+                    cost_in_cents: cents,
+                    cost_in_credits: credits,
+                    duration_seconds: 0.0,
+                })
+                .collect::<Vec<_>>();
+                (vec![model_charge], platform_charges)
+            }
+            LegacyCharges::CreditsOnly(_) | LegacyCharges::Unknown => (Vec::new(), Vec::new()),
+        };
+
+        if let Some(last) = records.last_mut() {
+            last.model_charges = model_charges;
+            last.platform_charges = platform_charges;
+            last.context_window_usage = context_window_usage;
+        }
+
+        Some(TurnPanelData::Legacy {
+            records,
+            charges: legacy_charges,
+        })
+    }
+
+    /// Get all request metadata for the turn that ENDS with the provided exchange_id
+    /// If the exchange_id is not the last in its turn, this will return `None`, indicating that the
+    /// turn details panel should not be displayed for that exchange
+    pub fn turn_panel_records(
+        &self,
+        exchange_id: AIAgentExchangeId,
+    ) -> Option<Vec<RequestMetadataRecord>> {
+        if !self.is_last_exchange_in_turn(exchange_id) {
+            return None;
+        }
+        let records = self.request_metadata_records_for_turn(exchange_id);
+        let covered_request_ids: HashSet<String> = records
+            .iter()
+            .map(|record| record.request_id.clone())
+            .collect();
+        let complete = self.turn_exchange_ids(exchange_id).into_iter().all(|id| {
+            let request_ids = self.exchange_request_ids(id);
+            !request_ids.is_empty()
+                && request_ids
+                    .iter()
+                    .all(|request_id| covered_request_ids.contains(request_id))
+        });
+        complete.then_some(records)
+    }
+
     /// Optimistically creates a subtask for the CLISubagent task when a user query is sent while
     /// the a command is running but no subagent has been spawned yet.
     ///
@@ -3694,15 +3925,9 @@ impl AIConversation {
         ctx: &mut ModelContext<BlocklistAIHistoryModel>,
     ) {
         // Don't persist viewer conversations (e.g. shared sessions).
-        // Under the unified stack, remote child placeholder conversations are
-        // also not persisted — they are rediscovered on restore via the
+        // Remote child placeholder conversations are rediscovered on restore via the
         // ancestor-list seed, so a persisted row would only risk going stale.
-        // Under the flag-off path, remote children must be persisted so they
-        // survive restarts.
-        if self.is_viewing_shared_session
-            || (self.is_remote_child
-                && crate::features::FeatureFlag::OrchestrationUnifiedStack.is_enabled())
-        {
+        if self.is_viewing_shared_session || self.is_remote_child {
             return;
         }
 
@@ -3780,6 +4005,7 @@ impl AIConversation {
                 autoexecute_override: Some(self.autoexecute_override.into()),
                 last_event_sequence: self.last_event_sequence,
                 pinned: self.pinned,
+                use_warp_credits_instead_of_chatgpt: self.use_warp_credits_instead_of_chatgpt,
             },
         };
         ctx.spawn(
@@ -3905,12 +4131,12 @@ impl AIConversation {
     }
 
     /// Compact usage totals for lightweight displays (e.g. the TUI footer's
-    /// usage entry): the GUI-consistent credits total plus the server-seeded
-    /// provider cost and any permitted live per-request deltas.
+    /// usage entry): the GUI-consistent credits total plus the billed cost the
+    /// server streamed or snapshotted.
     pub fn usage_totals(&self) -> ConversationUsageTotals {
         ConversationUsageTotals {
             credits_spent: self.inference_credits_spent() + self.platform_credits_spent(),
-            cost_in_cents: self.total_provider_cost_in_cents,
+            billed_cost_in_cents: self.conversation_usage_metadata.total_billed_cost_in_cents,
             has_usage: self.has_usage_metadata,
             charged_usage: self.conversation_usage_metadata.total_charged_usage,
         }

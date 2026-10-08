@@ -76,6 +76,7 @@ fn create_handler(agent: &CLIAgent) -> Option<Box<dyn CLIAgentSessionHandler>> {
             Some(Box::new(Osc9FallbackSessionHandler { agent: *agent }))
         }
         CLIAgent::Hermes
+        | CLIAgent::Kiro
         | CLIAgent::Amp
         | CLIAgent::Copilot
         | CLIAgent::CursorCli

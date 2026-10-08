@@ -1,6 +1,6 @@
 use std::any::Any;
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::pin::pin;
 use std::rc::Rc;
 use std::str::FromStr;
@@ -90,6 +90,7 @@ use crate::terminal::view::shared_session::ConversationEndedTombstoneView;
 use crate::terminal::{
     CLIAgent, MockTerminalManager, TerminalManager, TerminalModel, should_right_click_paste,
 };
+use crate::test_util::billing_unit::set_charge_unit;
 use crate::test_util::terminal::{
     add_window_with_id_and_terminal, initialize_app_for_terminal_view,
 };
@@ -98,6 +99,7 @@ use crate::view_components::find::FindWithinBlockState;
 use crate::workspace::view::tests::{initialize_app as initialize_workspace_app, mock_workspace};
 use crate::workspace::{ToastStack, WorkspaceAction};
 use crate::workspaces::user_workspaces::TeamlessScopeForTest;
+use crate::workspaces::workspace::ChargeUnit;
 
 fn add_window_with_cloud_mode_terminal(app: &mut App) -> ViewHandle<TerminalView> {
     let tips_model = app.add_model(|_| Default::default());
@@ -1611,6 +1613,7 @@ fn agent_view_user_query_input(query: &str) -> AIAgentInput {
         user_query_mode: UserQueryMode::Normal,
         running_command: None,
         intended_agent: None,
+        base: None,
     }
 }
 
@@ -2095,6 +2098,53 @@ fn is_passive_conversation_is_false_for_a_directly_issued_user_query() {
 }
 
 #[test]
+fn turn_panel_does_not_insert_a_block_after_its_footer() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        set_charge_unit(&mut app, ChargeUnit::Cents);
+        let terminal = add_window_with_terminal(&mut app, None);
+        let ai_block = terminal.update(&mut app, |view, ctx| {
+            view.insert_dummy_ai_block("query".to_string(), "response".to_string(), ctx)
+        });
+
+        let initial_content_ids = terminal.read(&app, |view, _| {
+            view.rich_content_views
+                .iter()
+                .map(|content| content.view_id())
+                .collect::<Vec<_>>()
+        });
+
+        ai_block.update(&mut app, |block, ctx| {
+            block.handle_action(&AIBlockAction::ToggleIsTurnPanelExpanded, ctx);
+        });
+        terminal.read(&app, |view, _| {
+            assert!(view.turn_panel_view_ids.contains_key(&ai_block.id()));
+            assert_eq!(
+                view.rich_content_views
+                    .iter()
+                    .map(|content| content.view_id())
+                    .collect::<Vec<_>>(),
+                initial_content_ids
+            );
+        });
+
+        ai_block.update(&mut app, |block, ctx| {
+            block.handle_action(&AIBlockAction::ToggleIsTurnPanelExpanded, ctx);
+        });
+        terminal.read(&app, |view, _| {
+            assert!(!view.turn_panel_view_ids.contains_key(&ai_block.id()));
+            assert_eq!(
+                view.rich_content_views
+                    .iter()
+                    .map(|content| content.view_id())
+                    .collect::<Vec<_>>(),
+                initial_content_ids
+            );
+        });
+    })
+}
+
+#[test]
 fn is_passive_conversation_is_recomputed_on_conversation_reassignment() {
     App::test((), |mut app| async move {
         initialize_app_for_terminal_view(&mut app);
@@ -2552,6 +2602,7 @@ fn agent_jump_user_query(query: &str) -> AIAgentInput {
         user_query_mode: UserQueryMode::Normal,
         running_command: None,
         intended_agent: None,
+        base: None,
     }
 }
 
@@ -2740,6 +2791,7 @@ fn restoring_conversation_to_new_pane_transfers_blocks_from_previous_terminal_su
                     user_query_mode: UserQueryMode::Normal,
                     running_command: None,
                     intended_agent: None,
+                    base: None,
                 }],
                 ctx,
             );
@@ -2854,6 +2906,7 @@ fn clicking_old_banner_for_open_conversation_focuses_current_terminal_surface_wi
                     user_query_mode: UserQueryMode::Normal,
                     running_command: None,
                     intended_agent: None,
+                    base: None,
                 }],
                 ctx,
             );
@@ -2994,6 +3047,7 @@ fn appended_exchange_renders_in_current_terminal_surface_after_conversation_tran
                     user_query_mode: UserQueryMode::Normal,
                     running_command: None,
                     intended_agent: None,
+                    base: None,
                 }],
                 ctx,
             );
@@ -3045,6 +3099,7 @@ fn appended_exchange_renders_in_current_terminal_surface_after_conversation_tran
                     user_query_mode: UserQueryMode::Normal,
                     running_command: None,
                     intended_agent: None,
+                    base: None,
                 }]);
                 let exchange_id = exchange.id;
                 conversation
@@ -4266,6 +4321,7 @@ fn pending_cloud_mode_query_waits_for_renderable_user_query_exchange() {
                     user_query_mode: UserQueryMode::default(),
                     running_command: None,
                     intended_agent: None,
+                    base: None,
                 },
                 ctx,
             );
@@ -4306,6 +4362,7 @@ fn pending_cloud_mode_query_clears_when_streaming_exchange_becomes_renderable() 
                     user_query_mode: UserQueryMode::Normal,
                     running_command: None,
                     intended_agent: None,
+                    base: None,
                 }],
                 ctx,
             );
@@ -9954,6 +10011,7 @@ fn close_find_bar_clears_ai_block_find_highlights() {
                     user_query_mode: UserQueryMode::Normal,
                     running_command: None,
                     intended_agent: None,
+                    base: None,
                 },
                 ctx,
             );
@@ -10089,6 +10147,7 @@ fn copy_selected_text_from_ai_block() {
                     user_query_mode: UserQueryMode::Normal,
                     running_command: None,
                     intended_agent: None,
+                    base: None,
                 },
                 ctx,
             );
